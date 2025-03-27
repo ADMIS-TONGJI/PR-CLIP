@@ -91,14 +91,11 @@ def get_model(args):
     )
     tokenize = open_clip.tokenize
     
-    # 检查是否是 TorchScript 模型，使用 torch.jit.load 来加载
     try:
         checkpoint = torch.jit.load(args.remoteclip_path, map_location="cpu")
         print("Loaded TorchScript model")
     except RuntimeError:
-        # 如果加载失败，则尝试使用普通的 torch.load
         checkpoint = torch.load(args.remoteclip_path, map_location="cpu")
-        # 加载 checkpoint
         
         if 'state_dict' in checkpoint:
             checkpoint = checkpoint['state_dict']
@@ -265,50 +262,26 @@ def retrieval_evaluation(args, model, preprocess, tokenize, recall_k_list=[1, 5,
     print(metrics)
     return metrics
 
-DATASET_PATH="D:/DataSets/CMRSITR/"
-MODEL_PATH="D:/Models/RemoteCLIP/"
 if __name__ == "__main__":
     args = parse_args()
-    # models = ["ViT-B-32","RN50", "ViT-L-14"]
-    # datasets=["RSICD","RSITMD","Sydney_captions","UCM_captions"]
 
-    models = ["ViT-B-32"]
-    datasets=["RSICD"]
+    model = "ViT-B-32"
     
-    # args.device = "cpu"
     args.device = "cuda"
-    for model_name in models:
-        for dataset_name in datasets:
-            args.model_name=model_name
-            args.retrieval_images_dir="/remote-home/share/dmb_nas2/shuyulou/RemoteCLIP-main/image_all/"
-            args.retrieval_json_dir="/remote-home/share/dmb_nas/CMRSITR/code-Firstgroup/ViLT-zhushatong/data/"+dataset_name+"/dataset.json"
-            # args.remoteclip_path='cache/weights/open_clip/'+model_name+".pt"
-            args.remoteclip_path = '/remote-home/share/dmb_nas2/shuyulou/RemoteCLIP-main/ITRA_lou_1223/itra_custom/logs/rsicd_best/checkpoints/best.pt'
-            # args.remoteclip_path = 'output/trained_model.pth'
-            # print(args)
-            model, preprocess_train, preprocess_val, preprocess_aug, tokenize = get_model(args)
+    args.model_name=model_name
+    args.retrieval_images_dir="./images/"
+    args.retrieval_json_dir="./dataset/test/rsitmd_test.csv"
+    args.remoteclip_path = './cache/rsitmd_best.pt'
+    model, preprocess_train, preprocess_val, preprocess_aug, tokenize = get_model(args)
 
-            # Image-text retrieval
-            all_metrics = {}
-            metrics = {}
-            retrieval_metrics = retrieval_evaluation(args, model, preprocess_aug, tokenize)
-            metrics.update(retrieval_metrics)
-            all_metrics.update(retrieval_metrics)
-            result_path="./result/"+model_name+"/"+dataset_name+".txt"
-            with open(result_path,"w",encoding="utf-8")as f:
-                for name, val in metrics.items():
-                    f.write(name+" "+str(round(val, 2))+"\n")
-                    print(name, round(val, 2))
-            
-            # 预热 GPU，避免第一次运行时间波动
-            for _ in range(5):
-                _ = retrieval_evaluation(args, model, preprocess_aug, tokenize)
-
-            # 计算推理时间
-            torch.cuda.synchronize()  # 确保 GPU 计算完成
-            start_time = time.time()
-            with torch.no_grad():  # 关闭梯度计算，加速推理
-                retrieval_metrics = retrieval_evaluation(args, model, preprocess_aug, tokenize)
-            torch.cuda.synchronize()  # 确保 GPU 计算完成
-            end_time = time.time()
-            print(f"Inference Time: {end_time - start_time:.6f} seconds")
+    # Image-text retrieval
+    all_metrics = {}
+    metrics = {}
+    retrieval_metrics = retrieval_evaluation(args, model, preprocess_aug, tokenize)
+    metrics.update(retrieval_metrics)
+    all_metrics.update(retrieval_metrics)
+    result_path="./result/"+model_name+"/"+dataset_name+".txt"
+    with open(result_path,"w",encoding="utf-8")as f:
+        for name, val in metrics.items():
+            f.write(name+" "+str(round(val, 2))+"\n")
+            print(name, round(val, 2))
