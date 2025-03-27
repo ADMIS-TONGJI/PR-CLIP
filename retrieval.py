@@ -271,7 +271,7 @@ if __name__ == "__main__":
     args.model_name=model_name
     args.retrieval_images_dir="./images/"
     args.retrieval_json_dir="./dataset/test/rsitmd_test.csv"
-    args.remoteclip_path = './cache/rsitmd_best.pt'
+    args.remoteclip_path = './cache/weights/rsitmd_best.pt'
     model, preprocess_train, preprocess_val, preprocess_aug, tokenize = get_model(args)
 
     # Image-text retrieval
