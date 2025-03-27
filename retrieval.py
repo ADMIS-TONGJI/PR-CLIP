@@ -1,0 +1,314 @@
+from tqdm import tqdm
+from torch.utils.data import Dataset, DataLoader
+from PIL import Image
+import argparse
+import os
+import torch
+import numpy as np
+import open_clip
+import json
+from clip_benchmark.metrics.zeroshot_retrieval import recall_at_k, batchify, dataloader_with_indices
+from clip_benchmark.datasets.builder import get_dataset_collate_fn
+import torch.nn.functional as F
+import torch
+import time
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument(
+        "--model-name", type=str,
+        choices=['RN50', 'ViT-B-32', 'ViT-L-14'],
+        help="Name of backbone. In open_clip.list_models() or hugging face transformers",
+    )
+
+    parser.add_argument(
+        "--retrieval-json-dir",
+        type=str,
+        default=None,
+        help="Path to retrieval json dataset",
+    )
+    parser.add_argument(
+        "--retrieval-images-dir",
+        type=str,
+        default="",
+    )
+    parser.add_argument(
+        "--remoteclip-path",
+        default=None,
+        type=str,
+        help="Path to remoteclip weight",
+    )
+    parser.add_argument("--batch-size", type=int, default=64, help="Batch size per GPU.")
+    parser.add_argument("--workers", type=int, default=8, help="Number of workers per GPU."
+    )
+
+    parser.add_argument(
+        "--dataset-dir",
+        type=str,
+        default=DATASET_PATH,
+        help="The Path of DataSet",
+    )
+
+    parser.add_argument(
+        "--dataset-name",
+        type=str,
+        default="UCM_captions",
+        help="The name of DataSet",
+    )
+
+    args, unknown = parser.parse_known_args()
+
+    if len(unknown) > 0:
+        print(f'[Unknow args]: {unknown}')
+    return args
+
+# def get_model(args):
+#     CLIP_model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+#         model_name=args.model_name,
+#         pretrained='openai',
+#         device=args.device,
+#         cache_dir='cache/weights/open_clip'
+#     )
+#     tokenize = open_clip.tokenize
+    
+
+#     # checkpoint = torch.load(args.remoteclip_path, map_location="cuda")
+#     checkpoint = torch.load(args.remoteclip_path, map_location="cpu")
+
+#     msg = CLIP_model.load_state_dict(checkpoint)
+
+#     print(msg)
+#     return CLIP_model, preprocess_train, preprocess_val, preprocess_val, tokenize
+
+def get_model(args):
+    CLIP_model, preprocess_train, preprocess_val = open_clip.create_model_and_transforms(
+        model_name=args.model_name,
+        pretrained='openai',
+        device=args.device,
+        cache_dir='cache/weights/open_clip'
+    )
+    tokenize = open_clip.tokenize
+    
+    # 检查是否是 TorchScript 模型，使用 torch.jit.load 来加载
+    try:
+        checkpoint = torch.jit.load(args.remoteclip_path, map_location="cpu")
+        print("Loaded TorchScript model")
+    except RuntimeError:
+        # 如果加载失败，则尝试使用普通的 torch.load
+        checkpoint = torch.load(args.remoteclip_path, map_location="cpu")
+        # 加载 checkpoint
+        
+        if 'state_dict' in checkpoint:
+            checkpoint = checkpoint['state_dict']
+        if True:
+            new_state_dict = {k.replace("module.", ""): v for k, v in checkpoint.items()}
+            new_state_dict1 = {}
+            for k, v in new_state_dict.items():
+                if k.startswith("text_backbone."):
+                    new_key = k.replace("text_backbone.", "")  # 修改命名
+                elif k.startswith("image_backbone."):
+                    new_key = k.replace("image_backbone.", "visual.")  # 适配 visual
+                else:
+                    new_key = k  # 其他保持不变
+                new_state_dict1[new_key] = v
+            msg = CLIP_model.load_state_dict(new_state_dict1, strict=False)
+        else:
+            msg = CLIP_model.load_state_dict(checkpoint, strict=False)
+        print(msg)
+
+    return CLIP_model, preprocess_train, preprocess_val, preprocess_val, tokenize
+
+   
+
+class JsonDataset(Dataset):
+    def __init__(self, json_dir, img_dir, transforms):
+        self.json_dir = json_dir
+        self.transforms = transforms
+        self.img_dir = img_dir
+        self.images = []
+        self.captions = []
+        self.read_json()
+        self.duplicate()
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        images = Image.open(os.path.join(self.img_dir, self.images[idx]))
+        images = self.transforms(images)
+        texts = self.captions[idx]
+        return images, texts
+
+    def read_json(self):
+        datasets = json.load(open(self.json_dir, "r"))
+        for image in datasets['images']:
+            if image['split'] == "test":
+                for text in image['sentences']:
+                    self.images.append(image['filename'])
+                    self.captions.append(text['raw'].capitalize())
+
+    def duplicate(self):
+        unique_images, indexs = np.unique(self.images, return_index=True)
+        if len(unique_images) != len(self.images):
+            self.duplicated_images = []
+            self.duplicated_captions = []
+            for index in indexs:
+                self.duplicated_images.append(self.images[index])
+                same_indexs = [i for i, x in enumerate(self.images) if x == self.images[index]]
+                captions = []
+                for same_index in same_indexs:
+                    captions.append(self.captions[same_index])
+                self.duplicated_captions.append(captions)
+
+            self.images = self.duplicated_images
+            self.captions = self.duplicated_captions
+
+# modified from clip_benchmark.metrics.zeroshot_retrieval
+def retrieval_evaluation(args, model, preprocess, tokenize, recall_k_list=[1, 5, 10]):
+    dataset = JsonDataset(
+        args.retrieval_json_dir,
+        args.retrieval_images_dir,
+        preprocess
+    )
+
+    dataloader = DataLoader(
+        dataset,
+        batch_size=args.batch_size,
+        num_workers=args.workers,
+        collate_fn=get_dataset_collate_fn('mscoco_captions')
+    )
+    n_batches = len(dataloader)
+
+    # list of batch of images embedding
+    batch_images_emb_list = []
+    # list of batch of text embedding
+    batch_texts_emb_list = []
+    # for each text, we collect the corresponding image index, as each image can have multiple corresponding texts
+    texts_image_index = []
+    dataloader = dataloader_with_indices(dataloader)
+
+    all_texts = []
+    for batch_images, batch_texts, inds in tqdm(dataloader, total=n_batches):
+        all_texts.extend([text for sublist in batch_texts for text in sublist])
+
+        batch_images = batch_images.to(args.device)
+        # store the index of image for each text# 移动图片到相同设备
+        batch_texts_image_index = [ind for ind, texts in zip(inds, batch_texts) for text in texts]
+        # tokenize all texts in the batch# 移动文本到相同设备
+
+        batch_texts = tokenize([text for i, texts in enumerate(batch_texts) for text in texts]).to(args.device)
+     
+        with torch.no_grad():
+            batch_image_features = model.encode_image(batch_images)
+            batch_text_features = model.encode_text(batch_texts)
+            batch_images_emb = F.normalize(batch_image_features, dim=-1)
+            batch_texts_emb = F.normalize(batch_text_features, dim=-1)
+
+        batch_images_emb_list.append(batch_images_emb.cpu())
+        batch_texts_emb_list.append(batch_texts_emb.cpu())
+        texts_image_index.extend(batch_texts_image_index)
+
+    batch_size = len(batch_images_emb_list[0])
+
+    # concatenate all embeddings
+    images_emb = torch.cat(batch_images_emb_list)
+    texts_emb = torch.cat(batch_texts_emb_list)
+
+    # get the score for each text and image pair
+    scores = texts_emb @ images_emb.t()
+    print(scores.shape)
+    file_path = "rsitmd_output.txt"
+    print(all_texts)
+    with open(file_path, "w", encoding="utf-8") as f:
+        for line in all_texts:
+            f.write(line + "\n")
+    top_k = 3
+    _, indices = torch.topk(scores.T, top_k, dim=1)
+    file_path = "rsitmd_top_indices_t.txt"
+    with open(file_path, "w", encoding="utf-8") as f:
+        for row in indices:
+            f.write(" ".join(map(str, row.tolist())) + "\n") 
+
+    # construct a the positive pair matrix, which tells whether each text-image pair is a positive or not
+    positive_pairs = torch.zeros_like(scores, dtype=bool)
+    positive_pairs[torch.arange(len(scores)), texts_image_index] = True
+    print(positive_pairs)
+    metrics = {}
+    for recall_k in recall_k_list:
+        '''
+        Note that recall_at_k computes **actual** recall i.e. nb_true_positive/nb_positives, where the number
+        of true positives, e.g. for text retrieval, is, for each image,  the number of retrieved texts matching that image among the top-k.
+        Also, the number of positives are the total number of texts matching the image in the dataset, as we have a set of captions
+        for each image, that number will be greater than 1 for text retrieval.
+        However, image/text retrieval recall@k, the way it is done in CLIP-like papers, is a bit different.
+        recall@k, in CLIP-like papers, is, for each image, either 1 or 0. It is 1 if atleast one text matches the image among the top-k.
+        so we can easily compute that using the actual recall, by checking whether there is at least one true positive,
+        which would be the case if the recall is greater than 0. One we compute the recal for each image (or text), we average
+        it over the dataset.
+        '''
+        metrics[f"retrieval-image2text-R@{recall_k}"] = (batchify(recall_at_k, scores.T, positive_pairs.T, batch_size,
+                                                                  args.device,
+                                                                  k=recall_k) > 0).float().mean().item() * 100
+
+    for recall_k in recall_k_list:
+        metrics[f"retrieval-text2image-R@{recall_k}"] = (batchify(recall_at_k, scores, positive_pairs, batch_size,
+                                                                  args.device,
+                                                                  k=recall_k) > 0).float().mean().item() * 100
+
+    metrics[f"retrieval-mean-recall"] = np.mean(list(metrics.values()))
+
+    for key, item in metrics.items():
+        metrics[key] = round(float(item), 2)
+    
+    print(metrics)
+    return metrics
+
+DATASET_PATH="D:/DataSets/CMRSITR/"
+MODEL_PATH="D:/Models/RemoteCLIP/"
+if __name__ == "__main__":
+    args = parse_args()
+    # models = ["ViT-B-32","RN50", "ViT-L-14"]
+    # datasets=["RSICD","RSITMD","Sydney_captions","UCM_captions"]
+
+    models = ["ViT-B-32"]
+    datasets=["RSICD"]
+    
+    # args.device = "cpu"
+    args.device = "cuda"
+    for model_name in models:
+        for dataset_name in datasets:
+            args.model_name=model_name
+            args.retrieval_images_dir="/remote-home/share/dmb_nas2/shuyulou/RemoteCLIP-main/image_all/"
+            args.retrieval_json_dir="/remote-home/share/dmb_nas/CMRSITR/code-Firstgroup/ViLT-zhushatong/data/"+dataset_name+"/dataset.json"
+            # args.remoteclip_path='cache/weights/open_clip/'+model_name+".pt"
+            args.remoteclip_path = '/remote-home/share/dmb_nas2/shuyulou/RemoteCLIP-main/ITRA_lou_1223/itra_custom/logs/rsicd_best/checkpoints/best.pt'
+            # args.remoteclip_path = 'output/trained_model.pth'
+            # print(args)
+            model, preprocess_train, preprocess_val, preprocess_aug, tokenize = get_model(args)
+
+            # Image-text retrieval
+            all_metrics = {}
+            metrics = {}
+            retrieval_metrics = retrieval_evaluation(args, model, preprocess_aug, tokenize)
+            metrics.update(retrieval_metrics)
+            all_metrics.update(retrieval_metrics)
+            result_path="./result/"+model_name+"/"+dataset_name+".txt"
+            with open(result_path,"w",encoding="utf-8")as f:
+                for name, val in metrics.items():
+                    f.write(name+" "+str(round(val, 2))+"\n")
+                    print(name, round(val, 2))
+            
+            # 预热 GPU，避免第一次运行时间波动
+            for _ in range(5):
+                _ = retrieval_evaluation(args, model, preprocess_aug, tokenize)
+
+            # 计算推理时间
+            torch.cuda.synchronize()  # 确保 GPU 计算完成
+            start_time = time.time()
+            with torch.no_grad():  # 关闭梯度计算，加速推理
+                retrieval_metrics = retrieval_evaluation(args, model, preprocess_aug, tokenize)
+            torch.cuda.synchronize()  # 确保 GPU 计算完成
+            end_time = time.time()
+            print(f"Inference Time: {end_time - start_time:.6f} seconds")
